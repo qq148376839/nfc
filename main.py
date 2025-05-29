@@ -1,6 +1,6 @@
 import random
 import datetime
-from typing import Union, List, Dict
+from typing import Union, List, Dict, Optional
 import os
 import subprocess
 import platform
@@ -8,6 +8,7 @@ import argparse
 import time
 import logging
 import shutil
+import threading
 from pathlib import Path
 
 # 配置日志
@@ -136,13 +137,133 @@ def save_mfd_file(data: bytes, filename: str = 'output.mfd') -> None:
 class NFCController:
     def __init__(self):
         self.system = platform.system().lower()
-        self.nfc_list_cmd = 'nfc-list'
+        self.nfc_poll_cmd = 'nfc-poll'
         self.nfc_mfclassic_cmd = 'nfc-mfclassic'
         self.processed_uids: List[str] = []  # 用于存储已处理的标签UID
         self.temp_dir = Path('temp_mfd_files')
         self.generated_files: List[Path] = []  # 用于跟踪生成的文件
+        self.blank_template = self.temp_dir / 'blank_template.mfd'
+        self.current_uid: Optional[str] = None
+        self.poll_thread: Optional[threading.Thread] = None
+        self.poll_running = False
         self.cleanup_old_files()
         self.temp_dir.mkdir(exist_ok=True)
+        self._create_blank_template()
+
+    def _create_blank_template(self):
+        """
+        创建空白模板文件
+        """
+        try:
+            # 生成一个标准的空白MFD数据
+            blank_data = generate_binary_mfd(
+                sector0_block1='00000000000000000000000000000000',
+                sector0_block2='00000000000000000000000000000000',
+                sector2_block3='00000000000000000000000000000000'
+            )
+            with open(self.blank_template, 'wb') as f:
+                f.write(blank_data)
+            logger.info("已创建空白模板文件")
+        except Exception as e:
+            logger.error(f"创建空白模板文件失败: {str(e)}")
+            raise
+
+    def _poll_nfc(self):
+        """
+        持续轮询NFC标签
+        """
+        while self.poll_running:
+            try:
+                result = subprocess.run(
+                    [self.nfc_poll_cmd, '-v'],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    timeout=1  # 设置超时，避免阻塞
+                )
+                
+                # 解析输出获取UID
+                uid = None
+                for line in result.stdout.split('\n'):
+                    if "UID (NFCID1)" in line:
+                        uid = line.split(':')[-1].strip()
+                        break
+                
+                self.current_uid = uid
+                time.sleep(0.1)  # 短暂休眠，避免CPU占用过高
+                
+            except subprocess.TimeoutExpired:
+                continue
+            except Exception as e:
+                logger.warning(f"轮询NFC时发生错误: {str(e)}")
+                time.sleep(1)
+
+    def start_polling(self):
+        """
+        开始轮询NFC标签
+        """
+        self.poll_running = True
+        self.poll_thread = threading.Thread(target=self._poll_nfc)
+        self.poll_thread.daemon = True
+        self.poll_thread.start()
+        logger.info("开始轮询NFC标签")
+
+    def stop_polling(self):
+        """
+        停止轮询NFC标签
+        """
+        self.poll_running = False
+        if self.poll_thread:
+            self.poll_thread.join(timeout=2)
+        logger.info("停止轮询NFC标签")
+
+    def wait_for_new_tag(self, processed_uids: List[str]) -> str:
+        """
+        等待新的标签放入
+        :param processed_uids: 已处理的标签UID列表
+        :return: str 新标签的UID
+        """
+        logger.info("请放入新的标签...")
+        while True:
+            if self.current_uid and self.current_uid not in processed_uids:
+                logger.info(f"检测到新标签，UID: {self.current_uid}")
+                return self.current_uid
+            elif self.current_uid in processed_uids:
+                logger.warning("检测到已处理的标签，请移除后放入新标签")
+            time.sleep(0.1)  # 缩短检查间隔
+
+    def write_tag_from_file(self, source_file: str, max_retries: int = 3) -> bool:
+        """
+        将文件内容写入标签，使用空白模板和忽略UID模式
+        :param source_file: 源文件
+        :param max_retries: 最大重试次数
+        :return: bool 是否成功
+        """
+        for attempt in range(max_retries):
+            try:
+                result = subprocess.run(
+                    [self.nfc_mfclassic_cmd, 'w', 'ab', 'u', 
+                     str(source_file), str(self.blank_template), 'f'],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8'
+                )
+                
+                if "Done" in result.stdout and "blocks written" in result.stdout:
+                    logger.info(f"标签写入成功 (尝试 {attempt + 1}/{max_retries})")
+                    return True
+                    
+                logger.warning(f"标签写入可能未完全成功 (尝试 {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    logger.info("等待5秒后重试...")
+                    time.sleep(5)
+                    
+            except Exception as e:
+                logger.error(f"写入标签时发生错误 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    
+        return False
 
     def cleanup_old_files(self):
         """
@@ -189,7 +310,7 @@ class NFCController:
         """
         try:
             result = subprocess.run(
-                [self.nfc_list_cmd],
+                [self.nfc_poll_cmd],
                 capture_output=True,
                 text=True,
                 encoding='utf-8'
@@ -208,112 +329,11 @@ class NFCController:
             return True
             
         except FileNotFoundError:
-            logger.error("未找到nfc-list命令，请确保已安装libnfc工具包")
+            logger.error("未找到nfc-poll命令，请确保已安装libnfc工具包")
             return False
         except Exception as e:
             logger.error(f"检测NFC读写器时发生错误: {str(e)}")
             return False
-
-    def get_tag_uid(self) -> str:
-        """
-        获取当前标签的UID
-        :return: str 标签UID，如果没有标签则返回空字符串
-        """
-        try:
-            result = subprocess.run(
-                [self.nfc_list_cmd],
-                capture_output=True,
-                text=True,
-                encoding='utf-8'
-            )
-            
-            if result.returncode != 0:
-                return ""
-                
-            # 解析输出获取UID
-            for line in result.stdout.split('\n'):
-                if "UID (NFCID1)" in line:
-                    uid = line.split(':')[-1].strip()
-                    return uid
-            return ""
-            
-        except Exception as e:
-            logger.error(f"获取标签UID时发生错误: {str(e)}")
-            return ""
-
-    def wait_for_new_tag(self, processed_uids: List[str]) -> str:
-        """
-        等待新的标签放入
-        :param processed_uids: 已处理的标签UID列表
-        :return: str 新标签的UID
-        """
-        logger.info("请放入新的标签...")
-        while True:
-            current_uid = self.get_tag_uid()
-            if current_uid and current_uid not in processed_uids:
-                logger.info(f"检测到新标签，UID: {current_uid}")
-                return current_uid
-            elif current_uid in processed_uids:
-                logger.warning("检测到已处理的标签，请移除后放入新标签")
-            time.sleep(1)
-
-    def read_tag_to_file(self, filename: str) -> bool:
-        """
-        读取标签内容到文件
-        :param filename: 输出文件名
-        :return: bool 是否成功
-        """
-        try:
-            result = subprocess.run(
-                [self.nfc_mfclassic_cmd, 'R', 'a', 'u', filename],
-                capture_output=True,
-                text=True,
-                encoding='utf-8'
-            )
-            
-            if result.returncode != 0:
-                logger.error(f"读取标签失败: {result.stderr}")
-                return False
-                
-            logger.info(f"标签读取成功，已保存到: {filename}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"读取标签时发生错误: {str(e)}")
-            return False
-
-    def write_tag_from_file(self, source_file: str, target_file: str, max_retries: int = 3) -> bool:
-        """
-        将文件内容写入标签
-        :param source_file: 源文件
-        :param target_file: 目标文件
-        :param max_retries: 最大重试次数
-        :return: bool 是否成功
-        """
-        for attempt in range(max_retries):
-            try:
-                result = subprocess.run(
-                    [self.nfc_mfclassic_cmd, 'w', 'ab', 'u', source_file, target_file],
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8'
-                )
-                
-                if "Done" in result.stdout and "blocks written" in result.stdout:
-                    logger.info(f"标签写入成功 (尝试 {attempt + 1}/{max_retries})")
-                    return True
-                    
-                logger.warning(f"标签写入可能未完全成功 (尝试 {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    logger.info("等待5秒后重试...")
-                    time.sleep(5)
-                    
-            except Exception as e:
-                logger.error(f"写入标签时发生错误 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    
-        return False
 
 def generate_filename(prefix: str = "tag", index: int = 1) -> str:
     """
@@ -342,6 +362,9 @@ def main():
         return
     
     try:
+        # 开始轮询NFC标签
+        nfc.start_polling()
+        
         # 开始处理标签
         for i in range(args.count):
             logger.info(f"开始处理第 {i+1}/{args.count} 个标签")
@@ -352,51 +375,46 @@ def main():
                 logger.error("未能获取到有效的标签UID")
                 continue
                 
-            # 生成临时文件名
-            temp_read_file = nfc.temp_dir / generate_filename("temp_read", i+1)
-            temp_write_file = nfc.temp_dir / generate_filename("temp_write", i+1)
-            final_file = Path(generate_filename(args.prefix, i+1))
-            
-            # 读取标签
-            if not nfc.read_tag_to_file(str(temp_read_file)):
-                logger.error("读取标签失败，跳过当前标签")
-                continue
-                
             # 生成新的MFD数据
             try:
                 mfd_data = generate_binary_mfd(
                     sector2_block3=generate_sector2_block3(args.date, args.suffix)
                 )
+                temp_write_file = nfc.temp_dir / generate_filename("temp_write", i+1)
+                final_file = Path(generate_filename(args.prefix, i+1))
+                
                 with open(temp_write_file, 'wb') as f:
                     f.write(mfd_data)
+                    
+                # 写入标签
+                if nfc.write_tag_from_file(str(temp_write_file)):
+                    # 写入成功，保存最终文件
+                    os.rename(temp_write_file, final_file)
+                    nfc.generated_files.append(final_file)
+                    nfc.processed_uids.append(current_uid)
+                    logger.info(f"标签 {i+1} 处理完成，最终文件: {final_file}")
+                else:
+                    logger.error(f"标签 {i+1} 写入失败")
+                    
+                # 清理临时文件
+                try:
+                    temp_write_file.unlink(missing_ok=True)
+                except Exception as e:
+                    logger.warning(f"清理临时文件时发生错误: {str(e)}")
+                    
             except Exception as e:
-                logger.error(f"生成MFD数据失败: {str(e)}")
+                logger.error(f"处理标签 {i+1} 时发生错误: {str(e)}")
                 continue
-                
-            # 写入标签
-            if nfc.write_tag_from_file(str(temp_write_file), str(temp_read_file)):
-                # 写入成功，保存最终文件
-                os.rename(temp_write_file, final_file)
-                nfc.generated_files.append(final_file)  # 添加到生成文件列表
-                nfc.processed_uids.append(current_uid)
-                logger.info(f"标签 {i+1} 处理完成，最终文件: {final_file}")
-            else:
-                logger.error(f"标签 {i+1} 写入失败")
-                
-            # 清理临时文件
-            try:
-                temp_read_file.unlink(missing_ok=True)
-                temp_write_file.unlink(missing_ok=True)
-            except Exception as e:
-                logger.warning(f"清理临时文件时发生错误: {str(e)}")
                 
             if i < args.count - 1:
                 logger.info("请移除当前标签，准备处理下一个标签...")
-                time.sleep(2)
+                time.sleep(1)
         
         logger.info("所有标签处理完成")
         
     finally:
+        # 停止轮询
+        nfc.stop_polling()
         # 清理生成的文件
         nfc.cleanup_generated_files(keep_files=args.keep_files)
         # 清理临时目录
