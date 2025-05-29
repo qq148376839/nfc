@@ -248,7 +248,7 @@ class NFCController:
         :param poll_interval: 轮询间隔（秒），默认0.1秒
         :return: str 新标签的UID
         """
-        logger.info("请放入新的标签...")
+        logger.info("等待放入新标签...")
         last_uid = ""
         no_tag_count = 0
         
@@ -258,21 +258,21 @@ class NFCController:
             # 如果没有检测到标签
             if not current_uid:
                 if last_uid:  # 如果之前有标签，说明标签被移除了
-                    logger.info("标签已移除，等待新标签...")
+                    logger.info("→ 标签已移除，请放入新标签")
                     last_uid = ""
                 no_tag_count += 1
                 if no_tag_count % 10 == 0:  # 每10次轮询提示一次
-                    logger.info("等待放入新标签...")
+                    logger.info("→ 等待放入新标签...")
                 time.sleep(poll_interval)
                 continue
             
             # 如果检测到标签
             if current_uid != last_uid:  # 标签发生变化
                 if current_uid in processed_uids:
-                    logger.warning("检测到已处理的标签，请移除后放入新标签")
+                    logger.warning("⚠ 检测到已处理的标签，请移除后放入新标签")
                     last_uid = current_uid
                 else:
-                    logger.info(f"检测到新标签，UID: {current_uid}")
+                    logger.info(f"✓ 检测到新标签 (UID: {current_uid})")
                     return current_uid
             
             last_uid = current_uid
@@ -356,77 +356,105 @@ def main():
     
     args = parser.parse_args()
     
+    logger.info("="*50)
+    logger.info("NFC标签写入程序启动")
+    logger.info(f"配置信息: 写入数量={args.count}, 日期={args.date or '当天'}, 尾号={args.suffix or '随机'}")
+    logger.info("="*50)
+    
     # 检查NFC读写器
+    logger.info("\n[步骤1] 检查NFC读写器状态...")
     nfc = NFCController()
     if not nfc.check_nfc_reader():
         logger.error("程序终止：NFC读写器未就绪")
         return
+    logger.info("✓ NFC读写器检查完成")
     
     try:
         # 开始处理标签
         for i in range(args.count):
-            logger.info(f"开始处理第 {i+1}/{args.count} 个标签")
+            logger.info("\n" + "="*50)
+            logger.info(f"[标签 {i+1}/{args.count}] 开始处理")
+            logger.info("="*50)
             
             # 等待新标签
+            logger.info("\n[步骤1] 等待放入新标签...")
             current_uid = nfc.wait_for_new_tag(nfc.processed_uids)
             if not current_uid:
-                logger.error("未能获取到有效的标签UID")
+                logger.error("未能获取到有效的标签UID，跳过当前标签")
                 continue
-                
+            logger.info(f"✓ 标签已就位 (UID: {current_uid})")
+            
             # 生成临时文件名
             temp_read_file = nfc.temp_dir / generate_filename("temp_read", i+1)
             temp_write_file = nfc.temp_dir / generate_filename("temp_write", i+1)
             final_file = Path(generate_filename(args.prefix, i+1))
             
             # 读取标签
+            logger.info("\n[步骤2] 读取标签数据...")
             if not nfc.read_tag_to_file(str(temp_read_file)):
                 logger.error("读取标签失败，跳过当前标签")
                 continue
-                
+            logger.info("✓ 标签数据读取完成")
+            
             # 生成新的MFD数据
+            logger.info("\n[步骤3] 生成新的标签数据...")
             try:
                 mfd_data = generate_binary_mfd(
                     sector2_block3=generate_sector2_block3(args.date, args.suffix)
                 )
                 with open(temp_write_file, 'wb') as f:
                     f.write(mfd_data)
+                logger.info("✓ 新标签数据生成完成")
             except Exception as e:
                 logger.error(f"生成MFD数据失败: {str(e)}")
                 continue
-                
+            
             # 写入标签
+            logger.info("\n[步骤4] 开始写入标签...")
             if nfc.write_tag_from_file(str(temp_write_file), str(temp_read_file)):
                 # 写入成功，保存最终文件
                 os.rename(temp_write_file, final_file)
-                nfc.generated_files.append(final_file)  # 添加到生成文件列表
+                nfc.generated_files.append(final_file)
                 nfc.processed_uids.append(current_uid)
-                logger.info(f"标签 {i+1} 处理完成，最终文件: {final_file}")
+                logger.info(f"✓ 标签写入成功")
+                logger.info(f"✓ 数据已保存到: {final_file}")
             else:
-                logger.error(f"标签 {i+1} 写入失败")
-                
+                logger.error("标签写入失败，请检查标签状态")
+                continue
+            
             # 清理临时文件
             try:
                 temp_read_file.unlink(missing_ok=True)
                 temp_write_file.unlink(missing_ok=True)
+                logger.info("✓ 临时文件清理完成")
             except Exception as e:
                 logger.warning(f"清理临时文件时发生错误: {str(e)}")
-                
+            
             if i < args.count - 1:
+                logger.info("\n" + "-"*50)
                 logger.info("请移除当前标签，准备处理下一个标签...")
+                logger.info("-"*50)
                 time.sleep(2)
         
+        logger.info("\n" + "="*50)
         logger.info("所有标签处理完成")
+        logger.info("="*50)
         
     finally:
         # 清理生成的文件
+        logger.info("\n[清理] 开始清理文件...")
         nfc.cleanup_generated_files(keep_files=args.keep_files)
         # 清理临时目录
         try:
             if nfc.temp_dir.exists():
                 shutil.rmtree(nfc.temp_dir)
-                logger.info("已清理临时文件目录")
+                logger.info("✓ 临时目录清理完成")
         except Exception as e:
             logger.warning(f"清理临时目录时发生错误: {str(e)}")
+        
+        logger.info("\n" + "="*50)
+        logger.info("程序执行完成")
+        logger.info("="*50)
 
 if __name__ == '__main__':
     main()
